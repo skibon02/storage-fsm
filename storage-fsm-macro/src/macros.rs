@@ -1,8 +1,8 @@
-use proc_macro2::TokenStream;
+use proc_macro2::{Ident, Span, TokenStream};
 use quote::{format_ident, quote};
-use syn::{parse_macro_input, FnArg, Pat, PatIdent, PatType, Token};
-use syn::spanned::Spanned;
-use crate::parsing::{StateMachineMacroParsed, StorageField};
+use syn::{parse_macro_input, Path, PathSegment, Type, TypePath};
+use syn::punctuated::Punctuated;
+use crate::parsing::{StateMachineMacroParsed, StatePossibleTransitions, StorageField};
 
 fn pub_fields_from_storage_fields(fields: &Vec<StorageField>) -> TokenStream {
     let fields = fields.iter().map(|f| {
@@ -116,6 +116,100 @@ pub fn state_machine(input: TokenStream) -> proc_macro::TokenStream {
     let storage_struct = format_ident!("{}Storage", state_machine_name);
     let initial_state = state_machine.initial_state;
 
+    let prepare_state_transitions = |transitions: &StatePossibleTransitions, transition_res: TokenStream| {
+        let state_transitions = transitions.transition_required_storage.iter().map(|(state, fields)| {
+            let transition_fn_name = format_ident!("transition_{}", state);
+            let args = args_from_storage_fields(fields);
+            let fields_names = fields.iter().map(|f| {
+                let field_name = &f.name;
+                quote! {
+                    #field_name
+                }
+            });
+            quote! {
+                pub fn #transition_fn_name(self, #args) -> #handler_result {
+                    #(
+                        *self.storage.#fields_names = #fields_names;
+                    )*
+                    #handler_result {
+                        result: #transition_res,
+                        parser_output: None,
+                    }
+                }
+            }
+        });
+        let stay_fn = if transitions.has_self_transition {
+            quote! {
+                pub fn stay(self) -> #handler_result {
+                    #handler_result {
+                        result: HandlerResult::Stay,
+                        parser_output: None,
+                    }
+                }
+            }
+        } else {
+            quote! {}
+        };
+
+        quote! {
+            #(#state_transitions)*
+            #stay_fn
+        }
+    };
+
+    // calculated stuff
+    let inline_states_transitions = inline_states.clone().map(|s| {
+        // example
+        let transitions = StatePossibleTransitions {
+            has_self_transition: true,
+            transition_required_storage: state_defs.get(&s).unwrap().dst_states.iter().map(|i| {
+                (i.clone(), vec![StorageField{
+                    name: format_ident!("v1"),
+                    ty: TypePath{
+                        path: Path {
+                            leading_colon: None,
+                            segments: Punctuated::from_iter([PathSegment{
+                                ident: Ident::new("u8", Span::call_site()),
+                                arguments: syn::PathArguments::None,
+                            }].into_iter()),
+                        },
+                        qself: None,
+                    }.into()
+                }])
+            }).collect(),
+        };
+
+        prepare_state_transitions(&transitions, quote! {
+            HandlerResult::InlineTransition(#inline_state_enum :: #s)
+        })
+    });
+
+    let non_inline_states_transitions = non_inline_states.clone().map(|s| {
+        // example
+        let transitions = StatePossibleTransitions {
+            has_self_transition: true,
+            transition_required_storage: state_defs.get(&s).unwrap().dst_states.iter().map(|i| {
+                (i.clone(), vec![StorageField{
+                    name: format_ident!("v2"),
+                    ty: TypePath{
+                        path: Path {
+                            leading_colon: None,
+                            segments: Punctuated::from_iter([PathSegment{
+                                ident: Ident::new("bool", Span::call_site()),
+                                arguments: syn::PathArguments::None,
+                            }].into_iter()),
+                        },
+                        qself: None,
+                    }.into()
+                }])
+            }).collect(),
+        };
+
+        prepare_state_transitions(&transitions, quote! {
+            HandlerResult::Transition(#state_enum :: #s)
+        })
+    });
+
     quote!{
         // 1. State enum
         #[derive(Copy, Clone, Debug)]
@@ -191,26 +285,16 @@ pub fn state_machine(input: TokenStream) -> proc_macro::TokenStream {
             )*
             #(
                 // transitions for non-inline states
-                impl #non_inline_states_storage_name {
+                impl #context_type<#non_inline_states_storage_name> {
                     // transitions
-                    pub fn stay() -> #handler_result {
-                        #handler_result {
-                            result: HandlerResult::Stay,
-                            parser_output: None,
-                        }
-                    }
+                    #non_inline_states_transitions
                 }
             )*
             #(
-            // transitions for inline states
-                impl #context_type<#inline_states_storage_name> {
+                // transitions for inline states
+                impl #inline_states_storage_name {
                     // transitions
-                    pub fn stay() -> #handler_result {
-                        #handler_result {
-                            result: HandlerResult::Stay,
-                            parser_output: None,
-                        }
-                    }
+                    #inline_states_transitions
                 }
             )*
 

@@ -8,6 +8,11 @@ use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::token::SelfType;
 
+pub struct StatePossibleTransitions {
+    pub has_self_transition: bool,
+    pub transition_required_storage: BTreeMap<Ident, Vec<StorageField>>,
+}
+
 #[derive(Clone)]
 pub struct StorageField {
     pub name: Ident,

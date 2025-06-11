@@ -92,14 +92,14 @@ pub fn main() {
     let mut parser = CsafeParser::new(|cmd| {
        match cmd {
            // // Commands
-           // CsafeParserCmd::StartFlag(ctx) => {
-           //     if ctx.byte == 0xF0 {
-           //         ctx.transition_dst_addr()
-           //     }
-           //     else {
-           //         ctx.stay()
-           //     }
-           // }
+           CsafeParserCmd::StartFlag(ctx) => {
+               if ctx.byte == 0xF0 {
+                   ctx.transition_DstAddr(true)
+               }
+               else {
+                   ctx.stay()
+               }
+           }
            // CsafeParserCmd::DstAddr(ctx) => {
            //     let addr = CsafeAddr::decode(ctx.byte);
            //     ctx.transition_src_addr(addr)
