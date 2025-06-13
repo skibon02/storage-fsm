@@ -3,10 +3,10 @@ use convert_case::{Case, Casing};
 use proc_macro2::{Ident, TokenStream};
 use quote::{format_ident, quote};
 use syn::{parse_macro_input};
-use crate::parsing::{StateMachineMacroParsed, StatePossibleTransitions, StateStorageFields, StorageField};
+use crate::parsing::{StateMachineMacroParsed, StatePossibleTransitions, StorageField};
 
-fn pub_fields_from_storage_fields(fields: &Vec<StorageField>) -> TokenStream {
-    let fields = fields.iter().map(|f| {
+fn pub_fields_from_storage_fields<'a>(fields: impl Iterator<Item=&'a StorageField>) -> TokenStream {
+    let fields = fields.map(|f| {
         let field_name = &f.name;
         let field_type = &f.ty;
         quote! {
@@ -18,8 +18,8 @@ fn pub_fields_from_storage_fields(fields: &Vec<StorageField>) -> TokenStream {
     }
 }
 
-fn args_from_storage_fields(fields: &Vec<StorageField>) -> TokenStream {
-    let fields = fields.iter().map(|f| {
+fn args_from_storage_fields<'a>(fields: impl Iterator<Item=&'a StorageField>) -> TokenStream {
+    let fields = fields.map(|f| {
         let field_name = &f.name;
         let field_type = &f.ty;
         quote! {
@@ -31,8 +31,8 @@ fn args_from_storage_fields(fields: &Vec<StorageField>) -> TokenStream {
     }
 }
 
-fn names_from_storage_fields(fields: &Vec<StorageField>) -> TokenStream {
-    let fields = fields.iter().map(|f| {
+fn names_from_storage_fields<'a>(fields: impl Iterator<Item=&'a StorageField>) -> TokenStream {
+    let fields = fields.map(|f| {
         let field_name = &f.name;
         quote! {
             #field_name
@@ -50,6 +50,16 @@ pub fn state_machine(input: TokenStream) -> proc_macro::TokenStream {
     let state_machine_name = state_machine.name.clone();
     let state_machine_output = state_machine.output_name.clone();
 
+    let state_machine_input_pub_fields = pub_fields_from_storage_fields(state_machine.input.iter());
+    let state_machine_input_args = args_from_storage_fields(state_machine.input.iter());
+    let state_machine_input_field_vals = names_from_storage_fields(state_machine.input.iter());
+
+
+    let handler_type = format_ident!("{}Handler", state_machine_name);
+    let cmd_enum = format_ident!("{}Cmd", state_machine_name);
+
+    let context_type = format_ident!("{}Context", state_machine_name);
+
     // Parsed state transitions
     let state_defs = &state_machine.transitions;
     let inline_states = state_defs.values().filter_map(|s| {
@@ -60,6 +70,7 @@ pub fn state_machine(input: TokenStream) -> proc_macro::TokenStream {
         }
     });
     let inline_states2 = inline_states.clone();
+    let inline_states3 = inline_states.clone();
     let non_inline_states = state_defs.values().filter_map(|s| {
         if !s.is_inline {
             Some(s.name.clone())
@@ -69,6 +80,32 @@ pub fn state_machine(input: TokenStream) -> proc_macro::TokenStream {
     });
     let non_inline_states2 = non_inline_states.clone();
     let non_inline_states3 = non_inline_states.clone();
+    let state_middleware_calls = non_inline_states.clone().map(|s| {
+        let state_mdw_calls = state_machine.middlewares.iter()
+            .filter(|m| {
+                // only include middlewares that are used in this state
+                state_defs.get(&s).unwrap().middlewares.iter().any(|m2| m2.0 == m.name)
+            })
+            .map(|m| {
+            let mdw_name = m.storage_type_name();
+            let mdw_field_name = m.field_name();
+
+            quote! {
+                let res = (self.handler)(
+                    #cmd_enum :: #mdw_name(#context_type {
+                        #state_machine_input_field_vals,
+                        storage: &mut self.storage.#mdw_field_name
+                    })
+                );
+
+                self.handle_transition_result(res, &mut handle_output);
+            }
+        });
+        quote! {
+            #(#state_mdw_calls)*
+        }
+    });
+
     let all_states = state_defs.keys();
 
     let state_enum = format_ident!("{}State", state_machine_name);
@@ -78,6 +115,7 @@ pub fn state_machine(input: TokenStream) -> proc_macro::TokenStream {
         format_ident!("{}Storage", s)
     });
     let inline_states_storage_name2 = inline_states_storage_name.clone();
+    let inline_states_storage_name3 = inline_states_storage_name.clone();
     let non_inline_states_storage_name = non_inline_states.clone().map(|s| {
         format_ident!("{}Storage", s)
     });
@@ -89,17 +127,8 @@ pub fn state_machine(input: TokenStream) -> proc_macro::TokenStream {
 
     let private_mod_name = format_ident!("__{}_private", state_machine_name);
 
-    let handler_type = format_ident!("{}Handler", state_machine_name);
-    let cmd_enum = format_ident!("{}Cmd", state_machine_name);
-
-    let context_type = format_ident!("{}Context", state_machine_name);
-
     // calculate transitions
     let transitions_calculated = state_machine.calculate_transitions();
-
-    let state_machine_input_pub_fields = pub_fields_from_storage_fields(&state_machine.input);
-    let state_machine_input_args = args_from_storage_fields(&state_machine.input);
-    let state_machine_input_field_vals = names_from_storage_fields(&state_machine.input);
 
     let middlewares_storage = state_machine.middlewares.iter().map(|m| {
         m.storage_type_name()
@@ -108,7 +137,7 @@ pub fn state_machine(input: TokenStream) -> proc_macro::TokenStream {
     let middlewares_storage3 = middlewares_storage.clone();
     let middlewares_storage_struct = state_machine.middlewares.iter().map(|m| {
         let storage_name = m.storage_type_name();
-        let fields = pub_fields_from_storage_fields(&m.fields);
+        let fields = pub_fields_from_storage_fields(m.fields.iter());
         quote!{
             #[derive(Default)]
             pub struct #storage_name {
@@ -125,7 +154,7 @@ pub fn state_machine(input: TokenStream) -> proc_macro::TokenStream {
     let prepare_state_transitions = |src_state: &Ident, transitions: &StatePossibleTransitions, inline: bool| {
         let state_transitions = transitions.transition_required_fields.iter().map(|(dst_state, fields)| {
             let transition_fn_name = format_ident!("transition_{}", dst_state.to_string().to_case(Case::Snake), span = dst_state.span());
-            let args = args_from_storage_fields(fields);
+            let args = args_from_storage_fields(fields.iter());
             let fields_names = fields.iter().map(|f| {
                 let field_name = &f.name;
                 quote! {
@@ -405,9 +434,9 @@ pub fn state_machine(input: TokenStream) -> proc_macro::TokenStream {
 
             #(
                 #middlewares_storage_struct
-                impl #context_type<#middlewares_storage> {
+                impl<'a> #context_type<&'a mut #middlewares_storage> {
                     // transitions
-                    pub fn next() -> #handler_result {
+                    pub fn next(self) -> #handler_result {
                         #handler_result {
                             result: HandlerResult::Stay,
                             parser_output: None,
@@ -432,7 +461,7 @@ pub fn state_machine(input: TokenStream) -> proc_macro::TokenStream {
 
                 // Middlewares
                 #(
-                    #middlewares_storage2(#context_type<#middlewares_storage3>),
+                    #middlewares_storage2(#context_type<&'a mut #middlewares_storage3>),
                 )*
             }
 
@@ -441,20 +470,39 @@ pub fn state_machine(input: TokenStream) -> proc_macro::TokenStream {
 
             impl #state_machine_name {
                 fn handle_transition_result(&mut self, res: #handler_result, handle_output: &mut impl FnMut(#state_machine_output)) {
-                    match res.result {
-                        HandlerResult::Stay => {
-                            // Stay in the current state
+
+                    let mut res = res;
+                    loop {
+                        if let Some(output) = res.parser_output {
+                            handle_output(output);
                         }
-                        HandlerResult::Transition(state) => {
-                            self.state = state;
+                        match res.result {
+                            HandlerResult::Stay => {
+                                // Stay in the current state
+                                break;
+                            }
+                            HandlerResult::Transition(state) => {
+                                self.state = state;
+                                break;
+                            }
+                            HandlerResult::InlineTransition(state) => {
+                                // Execute inline transition
+                                let ctx_arg = match state {
+                                    #(
+                                        #inline_state_enum :: #inline_states3 => {
+                                            #cmd_enum::#inline_states3(
+                                                #inline_states_storage_name3::from_storage(&mut self.storage)
+                                            )
+                                        }
+                                    )*
+                                };
+                                let result = (self.handler)(
+                                    ctx_arg
+                                );
+
+                                res = result;
+                            }
                         }
-                        HandlerResult::InlineTransition(state) => {
-                            // Execute inline transition
-                            unimplemented!("inline transition case");
-                        }
-                    }
-                    if let Some(output) = res.parser_output {
-                        handle_output(output);
                     }
                 }
                 pub fn advance(&mut self, #state_machine_input_args, mut handle_output: impl FnMut(#state_machine_output)) {
@@ -462,6 +510,7 @@ pub fn state_machine(input: TokenStream) -> proc_macro::TokenStream {
                         // handle non-inline states
                         #(
                             #state_enum :: #non_inline_states3 => {
+                                #state_middleware_calls
                                 let res = (self.handler)(
                                     #cmd_enum :: #non_inline_states3(#context_type {
                                         #state_machine_input_field_vals,
@@ -469,7 +518,7 @@ pub fn state_machine(input: TokenStream) -> proc_macro::TokenStream {
                                     })
                                 );
 
-                                self.handle_transition_result(res, &mut handle_output)
+                                self.handle_transition_result(res, &mut handle_output);
                             }
                         )*
                     }

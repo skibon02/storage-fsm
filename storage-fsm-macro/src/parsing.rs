@@ -1,5 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::{Debug, Formatter};
+use std::mem;
 use std::ops::Deref;
 use convert_case::{Case, Casing};
 use proc_macro2::{Delimiter, Ident, Span};
@@ -11,18 +13,38 @@ use syn::token::SelfType;
 
 pub struct StatePossibleTransitions {
     pub has_self_transition: bool,
-    pub transition_required_fields: BTreeMap<Ident, Vec<StorageField>>,
+    pub transition_required_fields: BTreeMap<Ident, BTreeSet<StorageField>>,
 }
 
 pub struct StateStorageFields {
-    pub own_storage_fields: Vec<StorageField>,
-    pub transitions_storage_fields: Vec<StorageField>,
+    pub own_storage_fields: BTreeSet<StorageField>,
+    pub transitions_storage_fields: BTreeSet<StorageField>,
 }
 
 #[derive(Clone)]
 pub struct StorageField {
     pub name: Ident,
     pub ty: Type,
+}
+
+impl PartialOrd for StorageField {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl PartialEq for StorageField {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+    }
+}
+
+impl Eq for StorageField {
+}
+
+impl Ord for StorageField {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.name.cmp(&other.name)
+    }
 }
 
 impl StorageField {
@@ -52,7 +74,7 @@ impl Debug for StorageField {
 #[derive(Clone)]
 pub struct MiddlewareDefinition {
     pub name: Ident,
-    pub fields: Vec<StorageField>,
+    pub fields: BTreeSet<StorageField>,
 }
 
 
@@ -66,7 +88,7 @@ impl Debug for MiddlewareDefinition {
     }
 }
 
-fn fields_named_to_storage_fields(fields: &FieldsNamed) -> Vec<StorageField> {
+fn fields_named_to_storage_fields(fields: &FieldsNamed) -> BTreeSet<StorageField> {
     fields.named.iter().map(|f| {
         let name = f.ident.clone().unwrap();
         let ty = f.ty.clone();
@@ -140,7 +162,7 @@ impl Parse for MiddlewareModifier {
 
 pub struct RawStateTransition {
     state: Ident,
-    new_storage_fields: Vec<StorageField>,
+    new_storage_fields: BTreeSet<StorageField>,
     dst_states: Vec<Ident>,
 }
 
@@ -148,11 +170,10 @@ impl Parse for RawStateTransition {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let state = input.parse::<Ident>()?;
         let new_storage_fields: Option<FieldsNamed> = input.parse().ok();
-        let new_storage_fields = if let Some(fields) = new_storage_fields {
-            fields_named_to_storage_fields(&fields)
-        } else {
-            Vec::new()
-        };
+        let new_storage_fields = new_storage_fields.as_ref()
+            .map(fields_named_to_storage_fields)
+            .unwrap_or_default();
+
         input.parse::<Token![=>]>()?;
         let dst_states: Punctuated<Ident, Token![|]> = Punctuated::parse_separated_nonempty_with(input, |s| {
             let Ok(id) = s.parse::<Ident>() else {
@@ -183,7 +204,8 @@ pub enum StateTransitionTree {
 
 fn replace_middleware_storage_fields(transitions: &mut BTreeMap<Ident, StateTransition>, middlewares: impl Iterator<Item=MiddlewareModifier> + Clone) {
     for transition in transitions.values_mut() {
-        for storage_field in transition.new_storage_fields.iter_mut() {
+        let fields = mem::take(&mut transition.new_storage_fields);
+        transition.new_storage_fields = fields.into_iter().map(|mut storage_field| {
             // try represent type as Ident
             if let Type::Path(type_path) = &mut storage_field.ty {
                 if let Some(segment) = type_path.path.segments.last_mut() {
@@ -193,7 +215,8 @@ fn replace_middleware_storage_fields(transitions: &mut BTreeMap<Ident, StateTran
                     }
                 }
             }
-        }
+            storage_field
+        }).collect();
     }
 }
 impl StateTransitionTree {
@@ -306,7 +329,7 @@ impl Parse for RootTransitionTree {
 #[derive(Clone)]
 pub struct StateTransition {
     pub name: Ident,
-    pub new_storage_fields: Vec<StorageField>,
+    pub new_storage_fields: BTreeSet<StorageField>,
     pub dst_states: Vec<Ident>,
 
     pub is_inline: bool,
@@ -346,7 +369,7 @@ impl Debug for StateTransition {
 
 pub struct StateMachineMacroParsed {
     pub name: Ident,
-    pub input: Vec<StorageField>,
+    pub input: BTreeSet<StorageField>,
     pub output_name: Ident,
     pub initial_state: Variant,
     pub middlewares: Vec<MiddlewareDefinition>,
@@ -359,34 +382,94 @@ pub struct StateDescription {
 }
 
 impl StateMachineMacroParsed {
+    fn calculate_storage_island(&self, src_state: &Ident) -> BTreeMap<Ident, BTreeSet<StorageField>> {
+        let mut res = BTreeMap::new();
+        let mut path= BTreeSet::new();
+        let mut visited = HashMap::new();
+
+        struct Ctx<'a> {
+            res: &'a mut BTreeMap<Ident, BTreeSet<StorageField>>,
+            path: &'a mut BTreeSet<Ident>,
+            visited: &'a mut HashMap<Ident, BTreeSet<Ident>>,
+            transitions: &'a BTreeMap<Ident, StateTransition>,
+        }
+        let mut ctx = Ctx {
+            res: &mut res,
+            path: &mut path,
+            visited: &mut visited,
+            transitions: &self.transitions,
+        };
+
+        fn explore_state(state: &Ident, ctx: &mut Ctx<'_>) {
+            let state_info = ctx.transitions.get(state).unwrap();
+            ctx.path.insert(state.clone());
+            for dst_state in state_info.dst_states.iter() {
+                if ctx.path.contains(dst_state) || ctx.transitions.get(dst_state).unwrap().is_reset_storage_state {
+                    // Skip cycles, ignore reset storage states
+                    continue;
+                }
+
+                for path_state in ctx.path.iter() {
+                    if ctx.visited.get(path_state).map_or(false, |visited_states| visited_states.contains(dst_state)) {
+                        // we already visited this pair, skip it
+                        continue;
+                    }
+                    else {
+                        // <- custom code with access to new state and its path
+                        let src_fields = &ctx.transitions.get(path_state).unwrap().new_storage_fields;
+                        let dst_fields = ctx.res.entry(dst_state.clone()).or_default();
+                        dst_fields.extend(src_fields.iter().cloned());
+                        ctx.visited.entry(path_state.clone())
+                            .or_default()
+                            .insert(dst_state.clone());
+                    }
+                }
+
+                explore_state(dst_state, ctx);
+            }
+            ctx.path.remove(state);
+        }
+
+        explore_state(src_state, &mut ctx);
+        res
+    }
     pub fn calculate_transitions(&self) -> BTreeMap<Ident, StateDescription> {
         let mut res = BTreeMap::new();
 
+        let mut calculated_prev_states_own_storage: BTreeMap<Ident, BTreeSet<StorageField>> = BTreeMap::new();
+        // calculate reset islands
+        for (src_state, state_info) in self.transitions.iter().filter(|(_, info)| info.is_reset_storage_state) {
+            let new_results: BTreeMap<Ident, BTreeSet<StorageField>> = self.calculate_storage_island(src_state);
+            calculated_prev_states_own_storage.extend(new_results);
+        }
+
         for (src_state, state_info) in &self.transitions {
             let state_def = self.transitions.get(&src_state).unwrap();
+            let has_self_transition = state_def.dst_states.iter().any(|i| i == src_state);
             let transitions_desc = StatePossibleTransitions {
-                has_self_transition: true,
+                has_self_transition,
                 transition_required_fields: state_def.dst_states.iter().map(|i| {
                     (i.clone(), self.transitions.get(i).unwrap().new_storage_fields.clone())
                 }).collect(),
             };
             
-            // TODO calculate accumulated storage here
             let own_storage_fields = state_info.new_storage_fields.clone();
+            let prev_states_storage = calculated_prev_states_own_storage.get(src_state).cloned().unwrap_or_default();
+            let combined_state_storage: BTreeSet<_> = own_storage_fields.iter().chain(prev_states_storage.iter()).cloned().collect();
             
             let mut merged_transitions_storage_fields = BTreeMap::new();
             for dst_state in &state_def.dst_states {
                 if let Some(transition_info) = self.transitions.get(dst_state) {
                     for storage_field in &transition_info.new_storage_fields {
-                        if !own_storage_fields.iter().any(|s| s.name == storage_field.name) {
+                        if !combined_state_storage.iter().any(|s| s.name == storage_field.name) {
                             merged_transitions_storage_fields.insert(storage_field.name.clone(), storage_field.clone());
                         }
                     }
                 }
             }
             let storage_fields_desc = StateStorageFields {
-                own_storage_fields,
-                transitions_storage_fields: Vec::from_iter(merged_transitions_storage_fields.values().cloned()),
+                own_storage_fields: combined_state_storage,
+                transitions_storage_fields: BTreeSet::from_iter(merged_transitions_storage_fields.values().cloned()),
             };
             
             let state_desc = StateDescription {
