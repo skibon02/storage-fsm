@@ -56,7 +56,7 @@ state_machine! {
     }
     states: {
         #[reset_storage]
-        StartFlag => DstAddr,
+        StartFlag => DstAddr | Self,
         {
             // parsing started
             DstAddr => SrcAddr,
@@ -67,7 +67,7 @@ state_machine! {
                 CommandLength {cmd: u8} => CommandBody
                 CommandBody {body: Vec<u8>, remaining_length: u8} => CommandChecksum | Self,
             }
-            CommandChecksum {command_checksum: CommandChecksum} => StopFlag,
+            CommandChecksum {collected_checksum: u8} => StopFlag,
 
             #[reset_storage]
             RspStatus => RspCommand,
@@ -76,7 +76,7 @@ state_machine! {
                 RspLength {cmd: u8} => RspBody,
                 RspBody {body: Vec<u8>, remaining_length: u8} => RspChecksum | Self,
             }
-            RspChecksum {command_checksum: RspChecksum} => StopFlag,
+            RspChecksum {collected_checksum: u8} => StopFlag,
 
             #[reset_storage]
             StopFlag => StartFlag,
@@ -87,14 +87,13 @@ state_machine! {
 
 pub fn main() {
     let bytes = [0xF2u8, 0x00, 0xFF, 0x7E, 0x01, 0x20, 0xF3];
-
     use CsafeParserOutput::*;
     let mut parser = CsafeParser::new(|cmd| {
        match cmd {
            // // Commands
            CsafeParserCmd::StartFlag(ctx) => {
                if ctx.byte == 0xF0 {
-                   ctx.transition_DstAddr(true)
+                   ctx.transition_dst_addr()
                }
                else {
                    ctx.stay()

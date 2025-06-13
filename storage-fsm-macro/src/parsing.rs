@@ -1,22 +1,46 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Debug, Formatter};
 use std::ops::Deref;
-use proc_macro2::{Delimiter, Ident};
-use quote::ToTokens;
-use syn::{braced, Attribute, FieldsNamed, Token, Type, Variant};
+use convert_case::{Case, Casing};
+use proc_macro2::{Delimiter, Ident, Span};
+use quote::{format_ident, ToTokens};
+use syn::{braced, Attribute, FieldsNamed, Path, PathSegment, Token, Type, TypePath, Variant};
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::token::SelfType;
 
 pub struct StatePossibleTransitions {
     pub has_self_transition: bool,
-    pub transition_required_storage: BTreeMap<Ident, Vec<StorageField>>,
+    pub transition_required_fields: BTreeMap<Ident, Vec<StorageField>>,
+}
+
+pub struct StateStorageFields {
+    pub own_storage_fields: Vec<StorageField>,
+    pub transitions_storage_fields: Vec<StorageField>,
 }
 
 #[derive(Clone)]
 pub struct StorageField {
     pub name: Ident,
     pub ty: Type,
+}
+
+impl StorageField {
+    pub fn new(name: Ident, ty: Ident) -> Self {
+        StorageField{
+            name,
+            ty: TypePath{
+                path: Path {
+                    leading_colon: None,
+                    segments: Punctuated::from_iter([PathSegment{
+                        ident: ty,
+                        arguments: syn::PathArguments::None,
+                    }].into_iter()),
+                },
+                qself: None,
+            }.into()
+        } 
+    }
 }
 
 impl Debug for StorageField {
@@ -30,6 +54,7 @@ pub struct MiddlewareDefinition {
     pub name: Ident,
     pub fields: Vec<StorageField>,
 }
+
 
 impl Debug for MiddlewareDefinition {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -64,6 +89,34 @@ impl Parse for MiddlewareDefinition {
 
 #[derive(Clone)]
 pub struct MiddlewareModifier(pub Ident);
+
+impl MiddlewareModifier {
+    pub fn field_name(&self) -> Ident {
+        // convert to snake case and append "_middleware"
+        let snake_case_name = self.0.to_string().to_case(Case::Snake);
+        format_ident!("{}_middleware", snake_case_name, span = self.0.span())
+    }
+
+    pub fn storage_type_name(&self) -> Ident {
+        format_ident!("{}Middleware", self.0, span = self.0.span())
+    }
+}
+
+impl MiddlewareDefinition {
+    pub fn field_name(&self) -> Ident {
+        // convert to snake case and append "_middleware"
+        let snake_case_name = self.name.to_string().to_case(Case::Snake);
+        format_ident!("{}_middleware", snake_case_name, span = self.name.span())
+    }
+
+    pub fn storage_type_name(&self) -> Ident {
+        format_ident!("{}Middleware", self.name, span = self.name.span())
+    }
+
+    pub fn to_modifier(&self) -> MiddlewareModifier {
+        MiddlewareModifier(self.name.clone())
+    }
+}
 impl Debug for MiddlewareModifier {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "MiddlewareModifier({})", self.0)
@@ -128,8 +181,23 @@ pub enum StateTransitionTree {
     InlineStateTransition(RawStateTransition),
 }
 
+fn replace_middleware_storage_fields(transitions: &mut BTreeMap<Ident, StateTransition>, middlewares: impl Iterator<Item=MiddlewareModifier> + Clone) {
+    for transition in transitions.values_mut() {
+        for storage_field in transition.new_storage_fields.iter_mut() {
+            // try represent type as Ident
+            if let Type::Path(type_path) = &mut storage_field.ty {
+                if let Some(segment) = type_path.path.segments.last_mut() {
+                    if let Some(middleware) = middlewares.clone().find(|m| m.0 == segment.ident) {
+                        let storage_type_name = middleware.storage_type_name();
+                        segment.ident = storage_type_name;
+                    }
+                }
+            }
+        }
+    }
+}
 impl StateTransitionTree {
-    pub fn collect_state_transitions(self, cur_additional_states: &Vec<Ident>,
+    fn collect_state_transitions(self, cur_additional_states: &Vec<Ident>,
                                      cur_middleware_modifiers: &Vec<MiddlewareModifier>) -> BTreeMap<Ident, StateTransition> {
         let mut res = BTreeMap::new();
         match self {
@@ -238,12 +306,12 @@ impl Parse for RootTransitionTree {
 #[derive(Clone)]
 pub struct StateTransition {
     pub name: Ident,
-    new_storage_fields: Vec<StorageField>,
+    pub new_storage_fields: Vec<StorageField>,
     pub dst_states: Vec<Ident>,
 
     pub is_inline: bool,
-    is_reset_storage_state: bool,
-    middlewares: Vec<MiddlewareModifier>,
+    pub is_reset_storage_state: bool,
+    pub middlewares: Vec<MiddlewareModifier>,
 }
 
 impl Debug for StateTransition {
@@ -282,11 +350,52 @@ pub struct StateMachineMacroParsed {
     pub output_name: Ident,
     pub initial_state: Variant,
     pub middlewares: Vec<MiddlewareDefinition>,
-    pub states: StateTransitionTree
+    pub transitions: BTreeMap<Ident, StateTransition>,
+}
+
+pub struct StateDescription {
+    pub transitions: StatePossibleTransitions,
+    pub storage_fields: StateStorageFields,
 }
 
 impl StateMachineMacroParsed {
-    pub fn calculate_transitions(&self) {
+    pub fn calculate_transitions(&self) -> BTreeMap<Ident, StateDescription> {
+        let mut res = BTreeMap::new();
+
+        for (src_state, state_info) in &self.transitions {
+            let state_def = self.transitions.get(&src_state).unwrap();
+            let transitions_desc = StatePossibleTransitions {
+                has_self_transition: true,
+                transition_required_fields: state_def.dst_states.iter().map(|i| {
+                    (i.clone(), self.transitions.get(i).unwrap().new_storage_fields.clone())
+                }).collect(),
+            };
+            
+            // TODO calculate accumulated storage here
+            let own_storage_fields = state_info.new_storage_fields.clone();
+            
+            let mut merged_transitions_storage_fields = BTreeMap::new();
+            for dst_state in &state_def.dst_states {
+                if let Some(transition_info) = self.transitions.get(dst_state) {
+                    for storage_field in &transition_info.new_storage_fields {
+                        if !own_storage_fields.iter().any(|s| s.name == storage_field.name) {
+                            merged_transitions_storage_fields.insert(storage_field.name.clone(), storage_field.clone());
+                        }
+                    }
+                }
+            }
+            let storage_fields_desc = StateStorageFields {
+                own_storage_fields,
+                transitions_storage_fields: Vec::from_iter(merged_transitions_storage_fields.values().cloned()),
+            };
+            
+            let state_desc = StateDescription {
+                transitions: transitions_desc,
+                storage_fields: storage_fields_desc,
+            };
+            res.insert(src_state.clone(), state_desc);
+        }
+        res
     }
 }
 
@@ -400,16 +509,23 @@ impl Parse for  StateMachineMacroParsed {
             // if middlewares are not specified, we use empty Vec
             middlewares = Some(Vec::new());
         };
+        let middlewares = middlewares.unwrap();
         let Some(states) = state_defs else {
             return Err(input.error("`states` must present in state_machine! body!"));
         };
+
+        let mut transitions = states.collect_state_transitions(&Vec::new(), &Vec::new());
+
+        // replace middleware storage fields
+        replace_middleware_storage_fields(&mut transitions, middlewares.iter().map(MiddlewareDefinition::to_modifier));
+
         Ok(StateMachineMacroParsed {
             name,
             input: sm_input,
             output_name,
             initial_state,
-            middlewares: middlewares.unwrap(),
-            states
+            middlewares,
+            transitions,
         })
     }
 }
