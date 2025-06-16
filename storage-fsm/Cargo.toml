@@ -6,5 +6,9 @@ edition = "2024"
 [dependencies]
 storage-fsm-macro = { path = "../storage-fsm-macro" }
 
+[dev-dependencies]
+log = "0.4.27"
+simple_logger = "5.0.0"
+
 [features]
 default = []

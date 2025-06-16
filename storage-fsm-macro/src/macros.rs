@@ -51,17 +51,47 @@ pub fn state_machine(input: TokenStream) -> proc_macro::TokenStream {
     let state_machine_output = state_machine.output_name.clone();
 
     let state_machine_input_pub_fields = pub_fields_from_storage_fields(state_machine.input.iter());
-    let state_machine_input_args = args_from_storage_fields(state_machine.input.iter());
+    let state_machine_input_pub_fields_refs = state_machine.input.iter().map(|f| {
+        let field_name = &f.name;
+        let field_type = &f.ty;
+
+        quote!{
+            pub #field_name: &'a mut #field_type
+        }
+    });
+    let state_machine_input_pub_fields_refs = quote! {
+        #(#state_machine_input_pub_fields_refs),*
+    };
+    let state_machine_input_args = state_machine.input.iter().map(|f| {
+        let field_name = &f.name;
+        let field_type = &f.ty;
+        quote! {
+            mut #field_name: #field_type
+        }
+    });
+    let state_machine_input_args = quote! {
+        #(#state_machine_input_args),*
+    };
     let state_machine_input_field_vals = names_from_storage_fields(state_machine.input.iter());
+    let state_machine_input_field_refs = state_machine.input.iter().map(|f| {
+        let field_name = &f.name;
+        quote! {
+            #field_name: &mut #field_name
+        }
+    });
+    let state_machine_input_field_refs = quote! {
+        #(#state_machine_input_field_refs),*
+    };
 
 
     let handler_type = format_ident!("{}Handler", state_machine_name);
     let cmd_enum = format_ident!("{}Cmd", state_machine_name);
 
     let context_type = format_ident!("{}Context", state_machine_name);
+    let middleware_context_type = format_ident!("{}MiddlewareContext", state_machine_name);
 
     // Parsed state transitions
-    let state_defs = &state_machine.transitions;
+    let state_defs = &state_machine.states;
     let inline_states = state_defs.values().filter_map(|s| {
         if s.is_inline {
             Some(s.name.clone())
@@ -92,13 +122,17 @@ pub fn state_machine(input: TokenStream) -> proc_macro::TokenStream {
 
             quote! {
                 let res = (self.handler)(
-                    #cmd_enum :: #mdw_name(#context_type {
-                        #state_machine_input_field_vals,
+                    #cmd_enum :: #mdw_name(#middleware_context_type {
+                        #state_machine_input_field_refs,
                         storage: &mut self.storage.#mdw_field_name
                     })
                 );
 
+                let is_drop = res.result.is_drop();
                 self.handle_transition_result(res, &mut handle_output);
+                if is_drop {
+                    return;
+                }
             }
         });
         quote! {
@@ -349,7 +383,7 @@ pub fn state_machine(input: TokenStream) -> proc_macro::TokenStream {
         use crate as _;
 
         type #handler_type = fn(#private_mod_name :: #cmd_enum) -> #private_mod_name :: #handler_result;
-        struct #state_machine_name {
+        pub struct #state_machine_name {
             state: #state_enum,
             handler: #handler_type,
             storage: #private_mod_name :: #storage_struct,
@@ -385,6 +419,10 @@ pub fn state_machine(input: TokenStream) -> proc_macro::TokenStream {
             pub struct #context_type<S> {
                 #state_machine_input_pub_fields,
                 pub storage: S
+            }
+            pub struct #middleware_context_type<'a, S> {
+                #state_machine_input_pub_fields_refs,
+                pub storage: &'a mut S
             }
             // keep fields private to control set of possible handler results
             pub struct #handler_result {
@@ -434,11 +472,18 @@ pub fn state_machine(input: TokenStream) -> proc_macro::TokenStream {
 
             #(
                 #middlewares_storage_struct
-                impl<'a> #context_type<&'a mut #middlewares_storage> {
+                impl<'a> #middleware_context_type<'a, #middlewares_storage> {
                     // transitions
                     pub fn next(self) -> #handler_result {
                         #handler_result {
                             result: HandlerResult::Stay,
+                            parser_output: None,
+                        }
+                    }
+
+                    pub fn drop(self) -> #handler_result {
+                        #handler_result {
+                            result: HandlerResult::Drop,
                             parser_output: None,
                         }
                     }
@@ -461,7 +506,7 @@ pub fn state_machine(input: TokenStream) -> proc_macro::TokenStream {
 
                 // Middlewares
                 #(
-                    #middlewares_storage2(#context_type<&'a mut #middlewares_storage3>),
+                    #middlewares_storage2(#middleware_context_type<'a, #middlewares_storage3>),
                 )*
             }
 
@@ -477,7 +522,7 @@ pub fn state_machine(input: TokenStream) -> proc_macro::TokenStream {
                             handle_output(output);
                         }
                         match res.result {
-                            HandlerResult::Stay => {
+                            HandlerResult::Stay | HandlerResult::Drop => {
                                 // Stay in the current state
                                 break;
                             }
@@ -525,7 +570,7 @@ pub fn state_machine(input: TokenStream) -> proc_macro::TokenStream {
                 }
             }
         }
-        use #private_mod_name::CsafeParserCmd;
+        use #private_mod_name::#cmd_enum;
 
     }.into()
 }

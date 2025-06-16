@@ -1,6 +1,8 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use indexmap::{IndexMap, IndexSet};
 use std::fmt::{Debug, Formatter};
+use std::hash::{Hash, Hasher};
 use std::mem;
 use std::ops::Deref;
 use convert_case::{Case, Casing};
@@ -11,14 +13,16 @@ use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::token::SelfType;
 
+#[derive(Debug)]
 pub struct StatePossibleTransitions {
     pub has_self_transition: bool,
-    pub transition_required_fields: BTreeMap<Ident, BTreeSet<StorageField>>,
+    pub transition_required_fields: IndexMap<Ident, IndexSet<StorageField>>,
 }
 
+#[derive(Debug)]
 pub struct StateStorageFields {
-    pub own_storage_fields: BTreeSet<StorageField>,
-    pub transitions_storage_fields: BTreeSet<StorageField>,
+    pub own_storage_fields: IndexSet<StorageField>,
+    pub transitions_storage_fields: IndexSet<StorageField>,
 }
 
 #[derive(Clone)]
@@ -39,6 +43,11 @@ impl PartialEq for StorageField {
 }
 
 impl Eq for StorageField {
+}
+impl Hash for StorageField {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+    }
 }
 
 impl Ord for StorageField {
@@ -74,7 +83,7 @@ impl Debug for StorageField {
 #[derive(Clone)]
 pub struct MiddlewareDefinition {
     pub name: Ident,
-    pub fields: BTreeSet<StorageField>,
+    pub fields: IndexSet<StorageField>,
 }
 
 
@@ -88,7 +97,7 @@ impl Debug for MiddlewareDefinition {
     }
 }
 
-fn fields_named_to_storage_fields(fields: &FieldsNamed) -> BTreeSet<StorageField> {
+fn fields_named_to_storage_fields(fields: &FieldsNamed) -> IndexSet<StorageField> {
     fields.named.iter().map(|f| {
         let name = f.ident.clone().unwrap();
         let ty = f.ty.clone();
@@ -162,7 +171,7 @@ impl Parse for MiddlewareModifier {
 
 pub struct RawStateTransition {
     state: Ident,
-    new_storage_fields: BTreeSet<StorageField>,
+    new_storage_fields: IndexSet<StorageField>,
     dst_states: Vec<Ident>,
 }
 
@@ -202,7 +211,7 @@ pub enum StateTransitionTree {
     InlineStateTransition(RawStateTransition),
 }
 
-fn replace_middleware_storage_fields(transitions: &mut BTreeMap<Ident, StateTransition>, middlewares: impl Iterator<Item=MiddlewareModifier> + Clone) {
+fn replace_middleware_storage_fields(transitions: &mut BTreeMap<Ident, StateDesc>, middlewares: impl Iterator<Item=MiddlewareModifier> + Clone) {
     for transition in transitions.values_mut() {
         let fields = mem::take(&mut transition.new_storage_fields);
         transition.new_storage_fields = fields.into_iter().map(|mut storage_field| {
@@ -221,7 +230,7 @@ fn replace_middleware_storage_fields(transitions: &mut BTreeMap<Ident, StateTran
 }
 impl StateTransitionTree {
     fn collect_state_transitions(self, cur_additional_states: &Vec<Ident>,
-                                     cur_middleware_modifiers: &Vec<MiddlewareModifier>) -> BTreeMap<Ident, StateTransition> {
+                                     cur_middleware_modifiers: &Vec<MiddlewareModifier>) -> BTreeMap<Ident, StateDesc> {
         let mut res = BTreeMap::new();
         match self {
             StateTransitionTree::Group {
@@ -242,7 +251,7 @@ impl StateTransitionTree {
             }
             StateTransitionTree::StateTransition(mut state, reset_storage) => {
                 state.dst_states.extend_from_slice(&cur_additional_states);
-                let transition = StateTransition {
+                let transition = StateDesc {
                     new_storage_fields: state.new_storage_fields,
                     dst_states: state.dst_states,
                     is_inline: false,
@@ -254,11 +263,12 @@ impl StateTransitionTree {
             }
             StateTransitionTree::InlineStateTransition(mut state) => {
                 state.dst_states.extend_from_slice(&cur_additional_states);
-                let transition = StateTransition {
+                let transition = StateDesc {
                     new_storage_fields: state.new_storage_fields,
                     dst_states: state.dst_states,
                     is_inline: true,
-                    is_reset_storage_state: false,
+                    // inline transitions are always reset storage states
+                    is_reset_storage_state: true,
                     middlewares: cur_middleware_modifiers.to_vec(),
                     name: state.state,
                 };
@@ -327,9 +337,10 @@ impl Parse for RootTransitionTree {
 }
 
 #[derive(Clone)]
-pub struct StateTransition {
+pub struct StateDesc {
     pub name: Ident,
-    pub new_storage_fields: BTreeSet<StorageField>,
+    /// New required storage fields. Provide them when transition to this state
+    pub new_storage_fields: IndexSet<StorageField>,
     pub dst_states: Vec<Ident>,
 
     pub is_inline: bool,
@@ -337,7 +348,7 @@ pub struct StateTransition {
     pub middlewares: Vec<MiddlewareModifier>,
 }
 
-impl Debug for StateTransition {
+impl Debug for StateDesc {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let storage_args = if !self.new_storage_fields.is_empty() {
             format!(" +{{ {} }}", self.new_storage_fields.iter().map(|f| format!("{:?}", f)).collect::<Vec<_>>().join(", "))
@@ -369,35 +380,39 @@ impl Debug for StateTransition {
 
 pub struct StateMachineMacroParsed {
     pub name: Ident,
-    pub input: BTreeSet<StorageField>,
+    pub input: IndexSet<StorageField>,
     pub output_name: Ident,
     pub initial_state: Variant,
     pub middlewares: Vec<MiddlewareDefinition>,
-    pub transitions: BTreeMap<Ident, StateTransition>,
+    pub states: BTreeMap<Ident, StateDesc>,
 }
 
+#[derive(Debug)]
 pub struct StateDescription {
     pub transitions: StatePossibleTransitions,
     pub storage_fields: StateStorageFields,
 }
 
 impl StateMachineMacroParsed {
-    fn calculate_storage_island(&self, src_state: &Ident) -> BTreeMap<Ident, BTreeSet<StorageField>> {
-        let mut res = BTreeMap::new();
-        let mut path= BTreeSet::new();
-        let mut visited = HashMap::new();
+    /// Calculate required storage fields for each state.
+    fn calculate_storage_island(&self, src_state: &Ident) -> BTreeMap<Ident, IndexSet<StorageField>> {
+        println!("Calculating island at src_state: {}", src_state);
+        let mut path= IndexSet::new();
+        let mut visited = IndexMap::new();
 
+        #[derive(Debug)]
         struct Ctx<'a> {
-            res: &'a mut BTreeMap<Ident, BTreeSet<StorageField>>,
-            path: &'a mut BTreeSet<Ident>,
-            visited: &'a mut HashMap<Ident, BTreeSet<Ident>>,
-            transitions: &'a BTreeMap<Ident, StateTransition>,
+            res: &'a mut BTreeMap<Ident, IndexSet<StorageField>>,
+            path: &'a mut IndexSet<Ident>,
+            visited: &'a mut IndexMap<Ident, IndexSet<Ident>>,
+            transitions: &'a BTreeMap<Ident, StateDesc>,
         }
+        let mut res = BTreeMap::new();
         let mut ctx = Ctx {
             res: &mut res,
             path: &mut path,
             visited: &mut visited,
-            transitions: &self.transitions,
+            transitions: &self.states,
         };
 
         fn explore_state(state: &Ident, ctx: &mut Ctx<'_>) {
@@ -431,45 +446,59 @@ impl StateMachineMacroParsed {
         }
 
         explore_state(src_state, &mut ctx);
+        // println!("Result: {:#?}", res);
+        // println!();
+
         res
     }
     pub fn calculate_transitions(&self) -> BTreeMap<Ident, StateDescription> {
         let mut res = BTreeMap::new();
 
-        let mut calculated_prev_states_own_storage: BTreeMap<Ident, BTreeSet<StorageField>> = BTreeMap::new();
-        // calculate reset islands
-        for (src_state, state_info) in self.transitions.iter().filter(|(_, info)| info.is_reset_storage_state) {
-            let new_results: BTreeMap<Ident, BTreeSet<StorageField>> = self.calculate_storage_island(src_state);
-            calculated_prev_states_own_storage.extend(new_results);
+        let mut calculated_required_state_fields: BTreeMap<Ident, IndexSet<StorageField>> = BTreeMap::new();
+        // calculate prev required storage fields for states
+        for (src_state, state_info) in self.states.iter().filter(|(_, info)| info.is_reset_storage_state) {
+            let state_storage: BTreeMap<Ident, IndexSet<StorageField>> = self.calculate_storage_island(src_state);
+            calculated_required_state_fields.extend(state_storage);
+        }
+        // Add new (own) storage fields
+        for (src_state, state_info) in &self.states {
+            let own_storage_fields = &state_info.new_storage_fields;
+            let prev_storage_fields = calculated_required_state_fields.entry(src_state.clone()).or_default();
+            prev_storage_fields.extend(own_storage_fields.iter().cloned());
         }
 
-        for (src_state, state_info) in &self.transitions {
-            let state_def = self.transitions.get(&src_state).unwrap();
+        for (src_state, state_info) in &self.states {
+            println!("Final calculation for state: {}", src_state);
+            let state_def = self.states.get(&src_state).unwrap();
             let has_self_transition = state_def.dst_states.iter().any(|i| i == src_state);
+
+            let required_storage_fields = calculated_required_state_fields.get(src_state).unwrap();
+
+            // List of storage fields that are required by all possible transitions from this state
+            let mut dst_required_storage_fields = IndexSet::new();
+            let mut transition_required_fields = IndexMap::new();
+
+            for dst_state in &state_def.dst_states {
+                let dst_storage_fields = calculated_required_state_fields.get(dst_state).unwrap();
+                transition_required_fields.insert(dst_state.clone(), dst_storage_fields
+                    .difference(required_storage_fields)
+                    .cloned()
+                    .collect());
+                dst_required_storage_fields.extend(dst_storage_fields.iter().cloned());
+            }
+            // remove current prev storage fields from dst_required_storage_fields
+            dst_required_storage_fields.retain(|f| !required_storage_fields.contains(f));
+
+            println!("Own storage fields: {:#?}", required_storage_fields);
+            println!("Out transitions merged fields: {:#?}",  dst_required_storage_fields);
+            println!("Transition required fields: {:#?}", transition_required_fields);
             let transitions_desc = StatePossibleTransitions {
                 has_self_transition,
-                transition_required_fields: state_def.dst_states.iter().map(|i| {
-                    (i.clone(), self.transitions.get(i).unwrap().new_storage_fields.clone())
-                }).collect(),
+                transition_required_fields,
             };
-            
-            let own_storage_fields = state_info.new_storage_fields.clone();
-            let prev_states_storage = calculated_prev_states_own_storage.get(src_state).cloned().unwrap_or_default();
-            let combined_state_storage: BTreeSet<_> = own_storage_fields.iter().chain(prev_states_storage.iter()).cloned().collect();
-            
-            let mut merged_transitions_storage_fields = BTreeMap::new();
-            for dst_state in &state_def.dst_states {
-                if let Some(transition_info) = self.transitions.get(dst_state) {
-                    for storage_field in &transition_info.new_storage_fields {
-                        if !combined_state_storage.iter().any(|s| s.name == storage_field.name) {
-                            merged_transitions_storage_fields.insert(storage_field.name.clone(), storage_field.clone());
-                        }
-                    }
-                }
-            }
             let storage_fields_desc = StateStorageFields {
-                own_storage_fields: combined_state_storage,
-                transitions_storage_fields: BTreeSet::from_iter(merged_transitions_storage_fields.values().cloned()),
+                own_storage_fields: required_storage_fields.clone(),
+                transitions_storage_fields: dst_required_storage_fields,
             };
             
             let state_desc = StateDescription {
@@ -478,6 +507,7 @@ impl StateMachineMacroParsed {
             };
             res.insert(src_state.clone(), state_desc);
         }
+
         res
     }
 }
@@ -608,8 +638,80 @@ impl Parse for  StateMachineMacroParsed {
             output_name,
             initial_state,
             middlewares,
-            transitions,
+            states: transitions,
         })
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use quote::{format_ident, quote};
+    use crate::parsing::StateMachineMacroParsed;
+
+    #[test]
+    pub fn calculation_test() {
+        let input = quote! {
+            name: CsafeRawParser
+            input: {byte: u8}
+            output_name: CsafeParserOutput
+            initial_state: StartFlag
+            middlewares: {
+                CommandChecksum {
+                    chk: u8
+                },
+                RspChecksum {
+                    chk: u8
+                },
+                Unstuffing {
+                    prev_stuffed: bool,
+                },
+            }
+            states: {
+                #[reset_storage]
+                StartFlag => DstAddr | Self,
+                {
+                    middleware Unstuffing {
+                        // parsing started
+                        DstAddr => SrcAddr,
+                        SrcAddr {dst_addr: CsafeAddr} => Command | RspStatus,
+                        middleware CommandChecksum {
+                            #[reset_storage]
+                            Command => CommandLength | CommandChecksum,
+                            CommandLength {cmd: u8} => CommandBody
+                            CommandBody {body: Vec<u8>, remaining_length: u8} => CommandChecksum | Self,
+                        }
+                        CommandChecksum {collected_checksum: u8} => StopFlag,
+
+                        middleware RspChecksum {
+                            #[reset_storage]
+                            RspStatus => RspCommand,
+                            RspCommand {status: CsafeStatus} => RspLength | RspChecksum,
+                            RspLength {cmd: u8} => RspBody,
+                            RspBody {body: Vec<u8>, remaining_length: u8} => RspChecksum | Self,
+                        }
+                        RspChecksum {collected_checksum: u8} => StopFlag,
+                    }
+                    #[reset_storage]
+                    StopFlag => StartFlag,
+                } => ParsingFailure,
+                inline ParsingFailure {err_msg: &'static str} => StartFlag,
+            }
+        };
+        let parsed: StateMachineMacroParsed = syn::parse2(input).unwrap();
+        let transitions = parsed.calculate_transitions();
+        let state_command_calculated = transitions.get(&format_ident!("Command")).unwrap();
+        assert!(!state_command_calculated.transitions.has_self_transition);
+        let command_to_command_checksum_fields = state_command_calculated.transitions.transition_required_fields
+            .get(&format_ident!("CommandChecksum")).unwrap();
+        println!("{:?}", command_to_command_checksum_fields);
+        assert_eq!(command_to_command_checksum_fields.len(), 4);
+
+        assert_eq!(parsed.middlewares.len(), 3);
+        let state_command_desc = parsed.states.get(&format_ident!("Command")).unwrap();
+        let cmd_middlewares = state_command_desc.middlewares.clone();
+        assert_eq!(cmd_middlewares.len(), 2);
+        assert_eq!(cmd_middlewares[0].0, format_ident!("Unstuffing"));
+        assert_eq!(cmd_middlewares[1].0, format_ident!("CommandChecksum"));
+    }
+}
