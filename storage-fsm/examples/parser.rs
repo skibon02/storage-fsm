@@ -135,8 +135,6 @@ pub fn main() {
         }
         Command(ctx) => {
             let cmd = ctx.byte;
-            // overwrite the command checksum with the current byte
-            ctx.storage.command_checksum_middleware.chk = ctx.byte;
             if cmd >= 0x80 {
                 let chk = ctx.storage.command_checksum_middleware.chk;
                 ctx.transition_command_checksum(cmd, vec![], 0, chk)
@@ -190,9 +188,6 @@ pub fn main() {
 
         // Responses
         RspStatus(ctx) => {
-            // overwrite the command checksum with the current byte
-            ctx.storage.rsp_checksum_middleware.chk = ctx.byte;
-
             let status = CsafeStatus(ctx.byte);
             ctx.transition_rsp_command(status)
         }

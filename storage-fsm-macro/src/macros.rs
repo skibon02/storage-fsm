@@ -186,13 +186,19 @@ pub fn state_machine(input: TokenStream) -> proc_macro::TokenStream {
     let initial_state = state_machine.initial_state;
 
     let prepare_state_transitions = |src_state: &Ident, transitions: &StatePossibleTransitions, inline: bool| {
-        let state_transitions = transitions.transition_required_fields.iter().map(|(dst_state, fields)| {
+        let state_transitions = transitions.transitions_desc.iter().map(|(dst_state, fields)| {
             let transition_fn_name = format_ident!("transition_{}", dst_state.to_string().to_case(Case::Snake), span = dst_state.span());
-            let args = args_from_storage_fields(fields.iter());
-            let fields_names = fields.iter().map(|f| {
+            let args = args_from_storage_fields(fields.new_required_fields.iter());
+            let fields_names = fields.new_required_fields.iter().map(|f| {
                 let field_name = &f.name;
                 quote! {
                     #field_name
+                }
+            });
+            let middleware_resets = fields.entered_middlewares.iter().map(|m| {
+                let id = &m.field_name();
+                quote! {
+                    #id
                 }
             });
 
@@ -220,6 +226,9 @@ pub fn state_machine(input: TokenStream) -> proc_macro::TokenStream {
                 pub fn #transition_fn_name(self, #args) -> #handler_result {
                     #(
                         *#self_storage.#fields_names = #fields_names;
+                    )*
+                    #(
+                        *#self_storage.#middleware_resets = Default::default();
                     )*
                     #handler_result {
                         result: #transition_res,
@@ -257,7 +266,8 @@ pub fn state_machine(input: TokenStream) -> proc_macro::TokenStream {
     });
 
     let all_states_storage_fields = all_states.clone().map(|s| {
-        let fields = &transitions_calculated.get(&s).unwrap().storage_fields;
+        let state_desc = transitions_calculated.get(&s).unwrap();
+        let fields = &state_desc.storage_fields;
         let pub_fields = fields.own_storage_fields.iter().map(|f| {
             let field_name = &f.name;
             let field_type = &f.ty;
@@ -284,6 +294,13 @@ pub fn state_machine(input: TokenStream) -> proc_macro::TokenStream {
                     pub #field_name: &'a mut #storage_name
                 }
             });
+        let private_middleware_fields = state_desc.storage_fields.private_middlewares.iter().map(|f| {
+            let field_name = &f.name;
+            let type_name = &f.ty;
+            quote! {
+                #field_name: &'a mut #type_name
+            }
+        });
         let phantom = if fields.transitions_storage_fields.is_empty() && fields.own_storage_fields.is_empty() && state_defs.get(&s).unwrap().middlewares.is_empty() {
             quote! {
                 _phantom: std::marker::PhantomData<&'a ()>
@@ -296,6 +313,7 @@ pub fn state_machine(input: TokenStream) -> proc_macro::TokenStream {
             #(#pub_fields,)*
             #(#transition_fields,)*
             #(#middleware_fields,)*
+            #(#private_middleware_fields,)*
             #phantom
         }
     });
@@ -325,6 +343,12 @@ pub fn state_machine(input: TokenStream) -> proc_macro::TokenStream {
                 #field_name
             }
         });
+        let private_middleware_fields = fields.private_middlewares.iter().map(|f| {
+            let field_name = &f.name;
+            quote! {
+                #field_name
+            }
+        });
 
         let phantom = if fields.transitions_storage_fields.is_empty() && fields.own_storage_fields.is_empty() && state_defs.get(&s).unwrap().middlewares.is_empty() {
             quote! {
@@ -339,6 +363,7 @@ pub fn state_machine(input: TokenStream) -> proc_macro::TokenStream {
                 #(#pub_fields_names: &mut storage.#pub_fields_names,)*
                 #(#transition_fields_names: &mut storage.#transition_fields_names,)*
                 #(#middleware_fields_names: &mut storage.#middleware_fields_names,)*
+                #(#private_middleware_fields: &mut storage.#private_middleware_fields,)*
                 #phantom
             }
         }

@@ -14,15 +14,21 @@ use syn::punctuated::Punctuated;
 use syn::token::SelfType;
 
 #[derive(Debug)]
+pub struct TransitionDesc {
+    pub new_required_fields: IndexSet<StorageField>,
+    pub entered_middlewares: Vec<MiddlewareModifier>,
+}
+#[derive(Debug)]
 pub struct StatePossibleTransitions {
     pub has_self_transition: bool,
-    pub transition_required_fields: IndexMap<Ident, IndexSet<StorageField>>,
+    pub transitions_desc: IndexMap<Ident, TransitionDesc>,
 }
 
 #[derive(Debug)]
 pub struct StateStorageFields {
     pub own_storage_fields: IndexSet<StorageField>,
     pub transitions_storage_fields: IndexSet<StorageField>,
+    pub private_middlewares: IndexSet<StorageField>,
 }
 
 #[derive(Clone)]
@@ -118,7 +124,7 @@ impl Parse for MiddlewareDefinition {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct MiddlewareModifier(pub Ident);
 
 impl MiddlewareModifier {
@@ -396,7 +402,7 @@ pub struct StateDescription {
 impl StateMachineMacroParsed {
     /// Calculate required storage fields for each state.
     fn calculate_storage_island(&self, src_state: &Ident) -> BTreeMap<Ident, IndexSet<StorageField>> {
-        println!("Calculating island at src_state: {}", src_state);
+        // println!("Calculating island at src_state: {}", src_state);
         let mut path= IndexSet::new();
         let mut visited = IndexMap::new();
 
@@ -468,37 +474,61 @@ impl StateMachineMacroParsed {
         }
 
         for (src_state, state_info) in &self.states {
-            println!("Final calculation for state: {}", src_state);
+            // println!("Final calculation for state: {}", src_state);
             let state_def = self.states.get(&src_state).unwrap();
+            let src_middlewares = &state_def.middlewares;
             let has_self_transition = state_def.dst_states.iter().any(|i| i == src_state);
 
             let required_storage_fields = calculated_required_state_fields.get(src_state).unwrap();
 
             // List of storage fields that are required by all possible transitions from this state
             let mut dst_required_storage_fields = IndexSet::new();
-            let mut transition_required_fields = IndexMap::new();
+            let mut transitions_desc = IndexMap::new();
+            let mut private_middlewares = IndexSet::new();
 
             for dst_state in &state_def.dst_states {
+                // new storage fields
                 let dst_storage_fields = calculated_required_state_fields.get(dst_state).unwrap();
-                transition_required_fields.insert(dst_state.clone(), dst_storage_fields
+                let transition_required_fields = dst_storage_fields
                     .difference(required_storage_fields)
                     .cloned()
-                    .collect());
+                    .collect();
+                
+                // new middlewares
+                let dst_middlewares = &self.states.get(&dst_state).unwrap().middlewares;
+                let entered_middlewares = dst_middlewares.iter().filter_map(|m| {
+                    if !src_middlewares.contains(&m) {
+                        Some(m.clone())
+                    }
+                    else {
+                        None
+                    }
+                });
+                private_middlewares.extend(entered_middlewares.clone().map(|m| {
+                    let field_name = m.field_name();
+                    let type_name = m.storage_type_name();
+                    StorageField::new(field_name, type_name)
+                }));
+                transitions_desc.insert(dst_state.clone(), TransitionDesc {
+                    new_required_fields: transition_required_fields,
+                    entered_middlewares: entered_middlewares.collect(),
+                });
                 dst_required_storage_fields.extend(dst_storage_fields.iter().cloned());
             }
             // remove current prev storage fields from dst_required_storage_fields
             dst_required_storage_fields.retain(|f| !required_storage_fields.contains(f));
 
-            println!("Own storage fields: {:#?}", required_storage_fields);
-            println!("Out transitions merged fields: {:#?}",  dst_required_storage_fields);
-            println!("Transition required fields: {:#?}", transition_required_fields);
+            // println!("Own storage fields: {:#?}", required_storage_fields);
+            // println!("Out transitions merged fields: {:#?}",  dst_required_storage_fields);
+            // println!("Transitions desc from state {:?}: {:#?}", src_state, transitions_desc);
             let transitions_desc = StatePossibleTransitions {
                 has_self_transition,
-                transition_required_fields,
+                transitions_desc,
             };
             let storage_fields_desc = StateStorageFields {
                 own_storage_fields: required_storage_fields.clone(),
                 transitions_storage_fields: dst_required_storage_fields,
+                private_middlewares,
             };
             
             let state_desc = StateDescription {
@@ -702,10 +732,10 @@ mod tests {
         let transitions = parsed.calculate_transitions();
         let state_command_calculated = transitions.get(&format_ident!("Command")).unwrap();
         assert!(!state_command_calculated.transitions.has_self_transition);
-        let command_to_command_checksum_fields = state_command_calculated.transitions.transition_required_fields
+        let transitions_desc = state_command_calculated.transitions.transitions_desc
             .get(&format_ident!("CommandChecksum")).unwrap();
-        println!("{:?}", command_to_command_checksum_fields);
-        assert_eq!(command_to_command_checksum_fields.len(), 4);
+        // println!("{:?}", transitions_desc);
+        assert_eq!(transitions_desc.new_required_fields.len(), 4);
 
         assert_eq!(parsed.middlewares.len(), 3);
         let state_command_desc = parsed.states.get(&format_ident!("Command")).unwrap();
